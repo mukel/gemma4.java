@@ -1,11 +1,10 @@
 # Gemma4.java
 
-Fast [Gemma 4](https://ai.google.dev/gemma) inference (dense and MoE) implemented in pure Java.
-
 <p align="center">
   <img src="https://ai.google.dev/static/gemma/images/gemma4_banner.png">
 </p>
 
+Fast [Gemma 4](https://ai.google.dev/gemma) inference (dense and MoE) implemented in pure Java.
 
 ## Features
 
@@ -15,8 +14,7 @@ Fast [Gemma 4](https://ai.google.dev/gemma) inference (dense and MoE) implemente
  - Support all Gemma 4 models: `E4B`, `E2B`, `31B` and `26B-A4B` (MoE), 
  - **Mixture of Experts (MoE) support** with expert routing
  - Sliding Window Attention (SWA) with full attention layers
- - Per-layer KV cache sharing
- - Per-head Q/K RMS normalization
+ - Per-layer KV cache sharing + per-head Q/K RMS normalization
  - Support `F16`, `BF16`, `F32` weights + `Q4_0`, `Q4_1`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0` quantizations
  - Fast matrix-vector multiplication routines using Java's [Vector API](https://openjdk.org/jeps/469)
  - Simple CLI with `--chat` and `--instruct` modes
