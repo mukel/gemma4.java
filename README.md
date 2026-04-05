@@ -52,6 +52,7 @@ Java 21+ is required, in particular for the [`MemorySegment` mmap-ing feature](h
 [`jbang`](https://www.jbang.dev/) is a perfect fit for this use case, just:
 ```
 jbang Gemma4.java --help
+jbang Gemma4.java --model ./gemma-4-E2B-it-Q4_0.gguf --chat
 ```
 
 Or execute directly, also via [`jbang`](https://www.jbang.dev/):
