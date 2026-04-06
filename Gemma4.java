@@ -1172,7 +1172,6 @@ record Llama(Configuration configuration, GemmaTokenizer tokenizer, Weights weig
 
                     // gate = gelu(gate_up[0:expertFF]), up = gate_up[expertFF:2*expertFF]
                     state.expertGateUp.mapInPlace(0, expertFF, Llama::gelu);
-                    // gate * up (in-place into first half)
                     for (int i = 0; i < expertFF; i++) {
                         state.expertGateUp.setFloat(i, state.expertGateUp.getFloat(i) * state.expertGateUp.getFloat(expertFF + i));
                     }
@@ -1237,8 +1236,11 @@ record Llama(Configuration configuration, GemmaTokenizer tokenizer, Weights weig
         return state.logits;
     }
 
+    private static final String ANSI_CYAN = "\033[36m";
+    private static final String ANSI_RESET = "\033[0m";
+
     public static List<Integer> generateTokens(Llama model, Llama.State state, int startPosition, List<Integer> promptTokens, Set<Integer> stopTokens, int maxTokens, Sampler sampler, boolean echo,
-                                               IntConsumer onTokenGenerated) {
+                                               boolean color, IntConsumer onTokenGenerated) {
         long startNanos = System.nanoTime();
         long startGen = 0;
         if (maxTokens < 0 || model.configuration().contextLength < maxTokens) {
@@ -1277,10 +1279,14 @@ record Llama(Configuration configuration, GemmaTokenizer tokenizer, Weights weig
         long elapsedNanos = System.nanoTime() - startNanos;
         long promptNanos = startGen - startNanos;
         long genNanos = elapsedNanos - startGen + startNanos;
-        System.err.printf("%ncontext: %d/%d prompt: %.2f tokens/s (%d) generation: %.2f tokens/s (%d)%n",
+        String timingPrefix = color ? ANSI_CYAN : "";
+        String timingSuffix = color ? ANSI_RESET : "";
+        System.err.printf("%n%scontext: %d/%d prompt: %.2f tokens/s (%d) generation: %.2f tokens/s (%d)%s%n",
+                timingPrefix,
                 startPosition + promptIndex + generatedTokens.size(), model.configuration().contextLength,
                 promptTokens.size() / (promptNanos / 1_000_000_000.0), promptTokens.size(),
-                generatedTokens.size() / (genNanos / 1_000_000_000.0), generatedTokens.size());
+                generatedTokens.size() / (genNanos / 1_000_000_000.0), generatedTokens.size(),
+                timingSuffix);
 
         return generatedTokens;
     }
@@ -3028,6 +3034,23 @@ class GemmaChatFormat {
         return tokens;
     }
 
+    public List<Integer> encodeSystemThinkingTurn(String systemPrompt) {
+        // Matches Gemma4 template with enable_thinking=true:
+        // <|turn>system\n<|think|>[system_content]<turn|>\n
+        List<Integer> tokens = new ArrayList<>();
+        tokens.addAll(encodeHeader(new Message(Role.SYSTEM, "")));
+        Integer thinkToken = tokenizer.getSpecialTokens().get("<|think|>");
+        if (thinkToken != null) {
+            tokens.add(thinkToken);
+        }
+        if (systemPrompt != null && !systemPrompt.isEmpty()) {
+            tokens.addAll(tokenizer.encode(systemPrompt.trim()));
+        }
+        tokens.add(endOfTurn);
+        tokens.addAll(tokenizer.encode("\n"));
+        return tokens;
+    }
+
     public record Message(GemmaChatFormat.Role role, String content) {
     }
 
@@ -3077,11 +3100,124 @@ public class Gemma4 {
         return sampler;
     }
 
+    private static final String ANSI_GREY  = "\033[90m";
+    private static final String ANSI_RESET = "\033[0m";
+
+    private static IntConsumer plainStreamingPrinter(GemmaTokenizer tokenizer) {
+        return token -> {
+            if (!tokenizer.isSpecialToken(token)) {
+                System.out.print(tokenizer.decode(List.of(token)));
+            }
+        };
+    }
+
+    private static void onThinkingStart(PrintStream thoughtOut, boolean ansi) {
+        if (ansi) {
+            thoughtOut.print(ANSI_GREY);
+        }
+        thoughtOut.println("[Start thinking]");
+    }
+
+    private static void onThinkingEnd(PrintStream thoughtOut, boolean ansi, boolean emitted) {
+        if (emitted) {
+            thoughtOut.println();
+        }
+        thoughtOut.println("[End thinking]");
+        if (ansi) {
+            thoughtOut.print(ANSI_RESET);
+        }
+        thoughtOut.println();
+    }
+
+    static boolean supportsAnsiColors(String colorMode) {
+        return switch (colorMode) {
+            case "on" -> true;
+            case "off" -> false;
+            case "auto" -> {
+                if (System.console() == null) {
+                    yield false;
+                }
+                String noColor = System.getenv("NO_COLOR");
+                if (noColor != null) {
+                    yield false;
+                }
+                String term = System.getenv("TERM");
+                yield term == null || !"dumb".equalsIgnoreCase(term);
+            }
+            default -> false;
+        };
+    }
+
+    private static IntConsumer streamingPrinter(GemmaTokenizer tokenizer, Options options) {
+        if (!options.stream()) {
+            return token -> {};
+        }
+        if (!options.think()) {
+            return plainStreamingPrinter(tokenizer);
+        }
+
+        Integer channelOpen = tokenizer.getSpecialTokens().get("<|channel>");
+        Integer channelClose = tokenizer.getSpecialTokens().get("<channel|>");
+        if (channelOpen == null || channelClose == null) {
+            return plainStreamingPrinter(tokenizer);
+        }
+
+        PrintStream thoughtOut = options.thinkInline() ? System.out : System.err;
+        boolean ansi = options.color();
+        boolean[] inChannel = {false};
+        boolean[] emitted = {false};
+        return token -> {
+            if (token == channelOpen) {
+                onThinkingStart(thoughtOut, ansi);
+                inChannel[0] = true;
+                emitted[0] = false;
+                return;
+            }
+            if (token == channelClose) {
+                onThinkingEnd(thoughtOut, ansi, emitted[0]);
+                inChannel[0] = false;
+                emitted[0] = false;
+                return;
+            }
+            if (!tokenizer.isSpecialToken(token)) {
+                String text = tokenizer.decode(List.of(token));
+                if (inChannel[0]) {
+                    thoughtOut.print(text);
+                    emitted[0] = true;
+                } else {
+                    System.out.print(text);
+                }
+            }
+        };
+    }
+
+    private static List<Integer> visibleTokens(GemmaTokenizer tokenizer, List<Integer> tokens, boolean think) {
+        return think ? stripThoughtChannelTokens(tokenizer, tokens) : tokens;
+    }
+
+    private static List<Integer> stripThoughtChannelTokens(GemmaTokenizer tokenizer, List<Integer> tokens) {
+        Integer channelOpen = tokenizer.getSpecialTokens().get("<|channel>");
+        Integer channelClose = tokenizer.getSpecialTokens().get("<channel|>");
+        if (channelOpen == null || channelClose == null || tokens.isEmpty()) {
+            return tokens;
+        }
+        List<Integer> out = new ArrayList<>(tokens.size());
+        boolean inChannel = false;
+        for (int tok : tokens) {
+            if (tok == channelOpen) { inChannel = true; continue; }
+            if (tok == channelClose) { inChannel = false; continue; }
+            if (!inChannel) { out.add(tok); }
+        }
+        return out;
+    }
+
     static void runInteractive(Llama model, Sampler sampler, Options options) {
         Llama.State state = null;
         GemmaChatFormat chatFormat = new GemmaChatFormat(model.tokenizer());
         List<Integer> conversationTokens = new ArrayList<>();
-        if (options.systemPrompt() != null) {
+        if (options.think()) {
+            conversationTokens.addAll(chatFormat.encodeSystemThinkingTurn(options.systemPrompt()));
+        } else if (options.systemPrompt() != null) {
             conversationTokens.addAll(chatFormat.encodeMessage(new GemmaChatFormat.Message(GemmaChatFormat.Role.SYSTEM, options.systemPrompt())));
         }
         int startPosition = 0;
@@ -3108,22 +3244,21 @@ public class Gemma4 {
             conversationTokens.addAll(chatFormat.encodeHeader(new GemmaChatFormat.Message(GemmaChatFormat.Role.MODEL, "")));
 
             Set<Integer> stopTokens = chatFormat.getStopTokens();
-            List<Integer> responseTokens = Llama.generateTokens(model, state, startPosition, conversationTokens.subList(startPosition, conversationTokens.size()), stopTokens, options.maxTokens(), sampler, options.echo(), token -> {
-                if (options.stream()) {
-                    if (!model.tokenizer().isSpecialToken(token)) {
-                        System.out.print(model.tokenizer().decode(List.of(token)));
-                    }
-                }
-            });
-            conversationTokens.addAll(responseTokens);
-            startPosition = conversationTokens.size();
+            IntConsumer printer = streamingPrinter(model.tokenizer(), options);
+            List<Integer> responseTokens = Llama.generateTokens(model, state, startPosition, conversationTokens.subList(startPosition, conversationTokens.size()), stopTokens, options.maxTokens(), sampler, options.echo(), options.color(), printer);
             Integer stopToken = null;
             if (!responseTokens.isEmpty() && stopTokens.contains(responseTokens.getLast())) {
                 stopToken = responseTokens.getLast();
                 responseTokens.removeLast();
             }
+            List<Integer> visibleResponseTokens = visibleTokens(model.tokenizer(), responseTokens, options.think());
+            conversationTokens.addAll(responseTokens);
+            if (stopToken != null) {
+                conversationTokens.add(stopToken);
+            }
+            startPosition = conversationTokens.size();
             if (!options.stream()) {
-                String responseText = model.tokenizer().decode(responseTokens);
+                String responseText = model.tokenizer().decode(visibleResponseTokens);
                 System.out.println(responseText);
             }
             if (stopToken == null) {
@@ -3141,7 +3276,9 @@ public class Gemma4 {
         if (options.suffix() != null) {
             promptTokens.addAll(chatFormat.encodeFillInTheMiddle(options.prompt(), options.suffix()));
         } else {
-            if (options.systemPrompt() != null) {
+            if (options.think()) {
+                promptTokens.addAll(chatFormat.encodeSystemThinkingTurn(options.systemPrompt()));
+            } else if (options.systemPrompt() != null) {
                 promptTokens.addAll(chatFormat.encodeMessage(new GemmaChatFormat.Message(GemmaChatFormat.Role.SYSTEM, options.systemPrompt())));
             }
             promptTokens.addAll(chatFormat.encodeMessage(new GemmaChatFormat.Message(GemmaChatFormat.Role.USER, options.prompt())));
@@ -3149,18 +3286,14 @@ public class Gemma4 {
         }
 
         Set<Integer> stopTokens = chatFormat.getStopTokens();
-        List<Integer> responseTokens = Llama.generateTokens(model, state, 0, promptTokens, stopTokens, options.maxTokens(), sampler, options.echo(), token -> {
-            if (options.stream()) {
-                if (!model.tokenizer().isSpecialToken(token)) {
-                    System.out.print(model.tokenizer().decode(List.of(token)));
-                }
-            }
-        });
+        IntConsumer printer = streamingPrinter(model.tokenizer(), options);
+        List<Integer> responseTokens = Llama.generateTokens(model, state, 0, promptTokens, stopTokens, options.maxTokens(), sampler, options.echo(), options.color(), printer);
         if (!responseTokens.isEmpty() && stopTokens.contains(responseTokens.getLast())) {
             responseTokens.removeLast();
         }
+        List<Integer> visibleResponseTokens = visibleTokens(model.tokenizer(), responseTokens, options.think());
         if (!options.stream()) {
-            String responseText = model.tokenizer().decode(responseTokens);
+            String responseText = model.tokenizer().decode(visibleResponseTokens);
             System.out.println(responseText);
         }
     }
@@ -3168,7 +3301,8 @@ public class Gemma4 {
     static final int DEFAULT_MAX_TOKENS = 1024;
 
     record Options(Path modelPath, String prompt, String suffix, String systemPrompt, boolean interactive,
-                   float temperature, float topp, long seed, int maxTokens, boolean stream, boolean echo) {
+                   float temperature, float topp, long seed, int maxTokens, boolean stream, boolean echo,
+                   boolean think, boolean thinkInline, boolean color) {
 
         Options {
             require(modelPath != null, "Missing argument: --model <path> is required");
@@ -3186,6 +3320,17 @@ public class Gemma4 {
             }
         }
 
+        static boolean parseBooleanOption(String optionName, String value) {
+            return switch (value.toLowerCase(Locale.ROOT)) {
+                case "true", "on" -> true;
+                case "false", "off" -> false;
+                default -> {
+                    require(false, "Invalid argument for %s: expected true|false|on|off, got %s", optionName, value);
+                    yield false;
+                }
+            };
+        }
+
         static void printUsage(PrintStream out) {
             out.println("Usage:  jbang Gemma4.java [options]");
             out.println();
@@ -3196,12 +3341,14 @@ public class Gemma4 {
             out.println("  --prompt, -p <string>         input prompt");
             out.println("  --suffix <string>             suffix for fill-in-the-middle request");
             out.println("  --system-prompt, -sp <string> system prompt for chat/instruct mode");
-            out.println("  --temperature, -temp <float>  temperature in [0,inf], default 0.1");
+            out.println("  --temperature, -temp <float>  temperature in [0,inf], default 1.0");
             out.println("  --top-p <float>               p value in top-p (nucleus) sampling in [0,1] default 0.95");
             out.println("  --seed <long>                 random seed, default System.nanoTime()");
             out.println("  --max-tokens, -n <int>        number of steps to run for < 0 = limited by context length, default " + DEFAULT_MAX_TOKENS);
-            out.println("  --stream <boolean>            print tokens during generation; may cause encoding artifacts for non ASCII text, default true");
-            out.println("  --echo <boolean>              print ALL tokens to stderr, if true, recommended to set --stream=false, default false");
+            out.println("  --stream <boolean>            print tokens during generation; accepts true|false|on|off, default true");
+            out.println("  --echo <boolean>              print ALL tokens to stderr; accepts true|false|on|off, default false");
+            out.println("  --color <on|off|auto>         colorize thinking output in terminal (default: auto)");
+            out.println("  --think <off|on|inline>       off: disable thoughts, on: thoughts to stderr, inline: thoughts to stdout");
             out.println();
             out.println("Interactive commands:");
             out.println("  /quit, /exit                  exit the chat");
@@ -3225,6 +3372,9 @@ public class Gemma4 {
             boolean interactive = false;
             boolean stream = true;
             boolean echo = false;
+            boolean think = false;
+            boolean thinkInline = false;
+            String colorMode = "auto";
 
             for (int i = 0; i < args.length; i++) {
                 String optionName = args[i];
@@ -3256,14 +3406,26 @@ public class Gemma4 {
                             case "--model", "-m" -> modelPath = Path.of(nextArg);
                             case "--seed", "-s" -> seed = Long.parseLong(nextArg);
                             case "--max-tokens", "-n" -> maxTokens = Integer.parseInt(nextArg);
-                            case "--stream" -> stream = Boolean.parseBoolean(nextArg);
-                            case "--echo" -> echo = Boolean.parseBoolean(nextArg);
+                            case "--stream" -> stream = parseBooleanOption(optionName, nextArg);
+                            case "--echo" -> echo = parseBooleanOption(optionName, nextArg);
+                            case "--color" -> colorMode = nextArg.toLowerCase(Locale.ROOT);
+                            case "--think" -> {
+                                String thinkMode = nextArg.toLowerCase(Locale.ROOT);
+                                thinkInline = List.of("inline", "stdout").contains(thinkMode);
+                                switch (thinkMode) {
+                                    case "on", "true", "inline", "stdout" -> think = true;
+                                    case "off", "false" -> think = false;
+                                    default -> require(false, "Invalid argument for %s: expected off|on|inline (or false|true|stdout), got %s", optionName, nextArg);
+                                }
+                            }
                             default -> require(false, "Unknown option: %s", optionName);
                         }
                     }
                 }
             }
-            return new Options(modelPath, prompt, suffix, systemPrompt, interactive, temperature, topp, seed, maxTokens, stream, echo);
+            require(List.of("on", "off", "auto").contains(colorMode), "Invalid argument: --color must be one of on|off|auto");
+            boolean color = Gemma4.supportsAnsiColors(colorMode);
+            return new Options(modelPath, prompt, suffix, systemPrompt, interactive, temperature, topp, seed, maxTokens, stream, echo, think, thinkInline, color);
         }
     }
 
