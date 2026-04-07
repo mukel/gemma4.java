@@ -102,9 +102,15 @@ PRELOAD_GGUF=/path/to/model.gguf make native
 A larger specialized binary is generated with parse overhead removed for that specific model.
 It can still run other models with normal parsing behavior.
 
-## Performance
+## Benchmarks
 
-[GraalVM 25+](https://www.graalvm.org/downloads) is recommended for the absolute best performance (JIT), it provides partial, but good support for the [Vector API](https://openjdk.org/jeps/469).
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/8554de11-c028-4ff4-88b7-b5c0665423da">
+</p>
+
+\*\**Hardware specs: AMD Ryzen 9950X 16C/32T 64GB (6400) Linux 6.18.12.*
+
+[GraalVM 25+](https://www.graalvm.org/downloads) is recommended for the absolute best performance (JITmode), it provides partial, but good support for the [Vector API](https://openjdk.org/jeps/469).
 
 By default, the "preferred" vector size is used, it can be force-set with `-Dllama.VectorBitSize=0|128|256|512`, `0` means disabled.
 
