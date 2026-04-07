@@ -110,7 +110,7 @@ It can still run other models with normal parsing behavior.
 
 \*\**Hardware specs: AMD Ryzen 9950X 16C/32T 64GB (6400) Linux 6.18.12.*
 
-[GraalVM 25+](https://www.graalvm.org/downloads) is recommended for the absolute best performance (JITmode), it provides partial, but good support for the [Vector API](https://openjdk.org/jeps/469).
+[GraalVM 25+](https://www.graalvm.org/downloads) is recommended for the absolute best performance (JIT mode), it provides partial, but good support for the [Vector API](https://openjdk.org/jeps/469), also in Native Image.
 
 By default, the "preferred" vector size is used, it can be force-set with `-Dllama.VectorBitSize=0|128|256|512`, `0` means disabled.
 
