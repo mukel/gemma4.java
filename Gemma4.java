@@ -3372,12 +3372,13 @@ class GemmaChatFormat {
 
     public List<Integer> encodeSystemThinkingTurn(String systemPrompt) {
         // Matches Gemma4 template with enable_thinking=true:
-        // <|turn>system\n<|think|>[system_content]<turn|>\n
+        // <|turn>system\n<|think|>\n[system_content]<turn|>\n
         List<Integer> tokens = new ArrayList<>();
         tokens.addAll(encodeHeader(new Message(Role.SYSTEM, "")));
         Integer thinkToken = tokenizer.getSpecialTokens().get("<|think|>");
         if (thinkToken != null) {
             tokens.add(thinkToken);
+            tokens.addAll(tokenizer.encode("\n"));
         }
         if (systemPrompt != null && !systemPrompt.isEmpty()) {
             tokens.addAll(tokenizer.encode(systemPrompt.trim()));
@@ -3595,6 +3596,9 @@ public class Gemma4 {
             conversationTokens.addAll(responseTokens);
             if (stopToken != null) {
                 conversationTokens.add(stopToken);
+                if (stopToken == chatFormat.endOfTurn) {
+                    conversationTokens.addAll(model.tokenizer().encode("\n"));
+                }
             }
             startPosition = conversationTokens.size();
             if (!options.stream()) {
