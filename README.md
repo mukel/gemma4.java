@@ -119,6 +119,14 @@ It can still run other models with the usual parsing overhead.
 
 By default, the "preferred" vector size is used, it can be force-set with `-Dllama.VectorBitSize=0|128|256|512`, `0` means disabled.
 
+## Related Repositories
+
+- [llama3.java](https://github.com/mukel/llama3.java)
+- [gemma4.java](https://github.com/mukel/gemma4.java)
+- [gptoss.java](https://github.com/mukel/gptoss.java)
+- [qwen35.java](https://github.com/mukel/qwen35.java)
+- [nemotron3.java](https://github.com/mukel/nemotron3.java)
+
 ## License
 
 Apache 2.0
