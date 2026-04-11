@@ -740,6 +740,9 @@ record Llama(Configuration configuration, GemmaTokenizer tokenizer, Weights weig
                              float logitSoftcapping, boolean[] isSWA, int nLayerKvFromStart,
                              int embeddingLengthPerLayer,
                              int expertCount, int expertUsedCount, int expertFeedForwardLength) {
+            if (slidingWindow <= 0 || Integer.bitCount(slidingWindow) != 1) {
+                throw new IllegalArgumentException("slidingWindow must be a power of 2, got " + slidingWindow);
+            }
             this.embeddingLength = embeddingLength;
             this.feedForwardLength = feedForwardLength;
             this.numberOfLayers = numberOfLayers;
@@ -781,6 +784,14 @@ record Llama(Configuration configuration, GemmaTokenizer tokenizer, Weights weig
 
         public int numberOfKeyValueHeads(int layer) {
             return numberOfKeyValueHeadsPerLayer[layer];
+        }
+
+        public int kvCachePositions(int layer) {
+            return isSWA[layer] ? Math.min(contextLength, slidingWindow) : contextLength;
+        }
+
+        public int kvCacheIndex(int layer, int position) {
+            return isSWA[layer] ? (position & (slidingWindow - 1)) : position;
         }
 
         public int kvDim(int layer) {
@@ -973,8 +984,9 @@ record Llama(Configuration configuration, GemmaTokenizer tokenizer, Weights weig
             this.valueCache = new FloatTensor[config.nLayerKvFromStart];
             for (int l = 0; l < config.nLayerKvFromStart; l++) {
                 int kvDim = config.kvDim(l);
-                keyCache[l] = ArrayFloatTensor.allocate(config.contextLength, kvDim);
-                valueCache[l] = ArrayFloatTensor.allocate(config.contextLength, kvDim);
+                int kvPositions = config.kvCachePositions(l);
+                keyCache[l] = F16FloatTensor.allocate(kvPositions, kvDim);
+                valueCache[l] = F16FloatTensor.allocate(kvPositions, kvDim);
             }
         }
     }
@@ -1125,8 +1137,9 @@ record Llama(Configuration configuration, GemmaTokenizer tokenizer, Weights weig
                     }
                 }
 
-                state.k.copyTo(0, state.keyCache[kvLayer], position * kvDim, kvDim);
-                state.v.copyTo(0, state.valueCache[kvLayer], position * kvDim, kvDim);
+                int kvPos = config.kvCacheIndex(l, position);
+                state.k.copyTo(0, state.keyCache[kvLayer], kvPos * kvDim, kvDim);
+                state.v.copyTo(0, state.valueCache[kvLayer], kvPos * kvDim, kvDim);
             }
 
             // Attention (scale=1.0, no 1/sqrt(headSize))
@@ -1134,12 +1147,14 @@ record Llama(Configuration configuration, GemmaTokenizer tokenizer, Weights weig
             int finalKvLayer = kvLayer;
             int finalKvDim = kvDim;
             int finalAttStart = attStart;
+            int finalLayer = l;
 
             Parallel.parallelFor(0, config.numberOfHeads, h -> {
                 int qOffset = h * headSize;
                 int attOffset = h * config.contextLength;
+                int kvHeadOffset = (h / kvMul) * headSize;
                 for (int t = finalAttStart; t <= position; t++) {
-                    int keyCacheOffset = t * finalKvDim + (h / kvMul) * headSize;
+                    int keyCacheOffset = config.kvCacheIndex(finalLayer, t) * finalKvDim + kvHeadOffset;
                     float score = state.q.dot(qOffset, state.keyCache[finalKvLayer], keyCacheOffset, headSize);
                     state.att.setFloat(attOffset + t, score);
                 }
@@ -1148,7 +1163,7 @@ record Llama(Configuration configuration, GemmaTokenizer tokenizer, Weights weig
                 int xbOffset = h * headSize;
                 state.xb_k.fillInPlace(xbOffset, headSize, 0f);
                 for (int t = finalAttStart; t <= position; t++) {
-                    int vOffset = t * finalKvDim + (h / kvMul) * headSize;
+                    int vOffset = config.kvCacheIndex(finalLayer, t) * finalKvDim + kvHeadOffset;
                     float a = state.att.getFloat(attOffset + t);
                     state.xb_k.saxpyInPlace(xbOffset, state.valueCache[finalKvLayer], vOffset, headSize, a);
                 }
@@ -1612,6 +1627,10 @@ abstract class FloatTensor {
 
     static short readShort(MemorySegment memorySegment, long offset) {
         return UNSAFE.getShort(memorySegment.address() + offset);
+    }
+
+    static void writeShort(MemorySegment memorySegment, long offset, short value) {
+        UNSAFE.putShort(memorySegment.address() + offset, value);
     }
 
     static float readFloat16(MemorySegment memorySegment, long offset) {
@@ -2956,24 +2975,42 @@ final class F16FloatTensor extends FloatTensor {
         this.memorySegment = memorySegment;
     }
 
+    static F16FloatTensor allocate(int... dims) {
+        int n = FloatTensor.numberOfElements(dims);
+        MemorySegment segment = Arena.ofAuto().allocate((long) n * 2);
+        return new F16FloatTensor(n, segment);
+    }
+
     @Override long size() { return size; }
-    @Override public void setFloat(int index, float value) { throw new UnsupportedOperationException("setFloat"); }
     @Override FloatVector getFloatVector(VectorSpecies<Float> species, int index) { throw new UnsupportedOperationException("getFloatVector"); }
     @Override public GGMLType type() { return GGMLType.F16; }
+
+    static FloatVector f16ToF32Vector(MemorySegment memSeg, long byteOffset) {
+        ShortVector bits16 = ShortVector.fromMemorySegment(S_SPECIES_HALF, memSeg, byteOffset, ByteOrder.LITTLE_ENDIAN);
+        var bits32 = bits16.castShape(I_SPECIES, 0).reinterpretAsInts();
+        var zeroExponentMask = bits32.and(0x7C00).neg().lanewise(VectorOperators.ASHR, 31);
+        bits32 = bits32.and(0x8000).lanewise(VectorOperators.LSHL, 16)
+                .or(bits32.and(0x7FFF).add(0x1C000).lanewise(VectorOperators.LSHL, 13).and(zeroExponentMask));
+        return bits32.reinterpretAsFloats();
+    }
 
     @Override
     public float getFloat(long index) {
         assert 0 <= index && index < size;
-        return readFloat16(memorySegment, (long) index * 2);
+        return readFloat16(memorySegment, index * 2);
+    }
+
+    @Override
+    public void setFloat(int index, float value) {
+        writeShort(memorySegment, (long) index * 2, Float.floatToFloat16(value));
     }
 
     @Override
     public float dot(int thisOffset, FloatTensor that, int thatOffset, int size) {
         if (FloatTensor.USE_VECTOR_API) {
             return vectorDot(this, thisOffset, (ArrayFloatTensor) that, thatOffset, size);
-        } else {
-            return FloatTensor.scalarDot(this, thisOffset, that, thatOffset, size);
         }
+        return FloatTensor.scalarDot(this, thisOffset, that, thatOffset, size);
     }
 
     private static float vectorDot(F16FloatTensor thiz, int thisOffset, ArrayFloatTensor that, int thatOffset, int size) {
@@ -2982,12 +3019,7 @@ final class F16FloatTensor extends FloatTensor {
         int upperBound = F_SPECIES.loopBound(size);
         for (int i = 0; i < upperBound; i += F_SPECIES.length()) {
             FloatVector thatVector = that.getFloatVector(F_SPECIES, thatOffset + i);
-            ShortVector bits16 = ShortVector.fromMemorySegment(S_SPECIES_HALF, thiz.memorySegment, (thisOffset + i) * 2L, ByteOrder.LITTLE_ENDIAN);
-            var bits32 = bits16.castShape(I_SPECIES, 0).reinterpretAsInts();
-            var zeroExponentMask = bits32.and(0x7C00).neg().lanewise(VectorOperators.ASHR, 31);
-            bits32 = bits32.and(0x8000).lanewise(VectorOperators.LSHL, 16)
-                    .or(bits32.and(0x7FFF).add(0x1C000).lanewise(VectorOperators.LSHL, 13).and(zeroExponentMask));
-            FloatVector thizVector = bits32.reinterpretAsFloats();
+            FloatVector thizVector = f16ToF32Vector(thiz.memorySegment, (thisOffset + i) * 2L);
             val = thizVector.fma(thatVector, val);
         }
         float result = val.reduceLanes(VectorOperators.ADD);
@@ -3078,6 +3110,30 @@ final class ArrayFloatTensor extends FloatTensor {
             result += thiz.values[thisOffset + i] * that.values[thatOffset + i];
         }
         return result;
+    }
+
+    @Override
+    FloatTensor saxpyInPlace(int thisOffset, FloatTensor that, int thatOffset, int size, float a) {
+        if (that instanceof F16FloatTensor f16 && USE_VECTOR_API) {
+            return vectorSaxpyF16(this, thisOffset, f16, thatOffset, size, a);
+        }
+        return super.saxpyInPlace(thisOffset, that, thatOffset, size, a);
+    }
+
+    private static FloatTensor vectorSaxpyF16(ArrayFloatTensor thiz, int thisOffset,
+                                               F16FloatTensor that, int thatOffset,
+                                               int size, float a) {
+        FloatVector va = FloatVector.broadcast(F_SPECIES, a);
+        int upperBound = F_SPECIES.loopBound(size);
+        for (int i = 0; i < upperBound; i += F_SPECIES.length()) {
+            FloatVector thatVector = F16FloatTensor.f16ToF32Vector(that.memorySegment, (thatOffset + i) * 2L);
+            FloatVector thisVector = FloatVector.fromArray(F_SPECIES, thiz.values, thisOffset + i);
+            va.fma(thatVector, thisVector).intoArray(thiz.values, thisOffset + i);
+        }
+        for (int i = upperBound; i < size; i++) {
+            thiz.values[thisOffset + i] += a * that.getFloat(thatOffset + i);
+        }
+        return thiz;
     }
 }
 
