@@ -13,7 +13,7 @@ NATIVE_IMAGE ?= native-image
 JAVA_MAJOR_VERSION := $(shell $(JAVA) -version 2>&1 | head -n 1 | cut -d'"' -f2 | cut -d'.' -f1)
 
 JAVA_COMPILE_OPTIONS = --enable-preview -source $(JAVA_MAJOR_VERSION) -g --add-modules jdk.incubator.vector
-JAVA_RUNTIME_OPTIONS = --enable-preview --add-modules jdk.incubator.vector
+JAVA_RUNTIME_OPTIONS = --enable-preview --add-modules jdk.incubator.vector --sun-misc-unsafe-memory-access=allow
 
 ifeq ($(OS),Windows_NT)
     EXE := .exe
@@ -69,6 +69,7 @@ $(NATIVE_FILE): jar
 		-march=native \
 		--enable-preview \
 		--add-modules jdk.incubator.vector \
+		-J--sun-misc-unsafe-memory-access=allow \
 		--initialize-at-build-time='com.llama4j.AOT,com.llama4j.FloatTensor,com.llama4j.' \
 		-Djdk.incubator.vector.VECTOR_ACCESS_OOB_CHECK=0 \
 		-Dgemma4.PreloadGGUF=$(PRELOAD_GGUF) \
