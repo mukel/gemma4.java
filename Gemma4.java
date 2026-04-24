@@ -3349,7 +3349,7 @@ final class ToppSampler implements Sampler {
                 lastIndex = i;
                 break;
             }
-            siftDown(indices, 0, i - 1, comparator);
+            siftDown(indices, 0, i, comparator);
         }
 
         float r = rng.nextFloat(1f) * cumulativeProb;
